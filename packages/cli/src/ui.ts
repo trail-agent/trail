@@ -72,6 +72,7 @@ export function createRenderer(write: (text: string) => void = (t) => process.st
           newline()
           const lines = event.payload.content.split("\n")
           const evidence = lines.at(-1)?.startsWith("[evidence:") ? lines.pop() : undefined
+          while (lines.length > 1 && lines[0]!.trim() === "") lines.shift()
           const shown = lines.slice(0, RESULT_PREVIEW_LINES).map((l) => `  ${l.slice(0, 160)}`).join("\n")
           const more = lines.length > RESULT_PREVIEW_LINES ? dim(`\n  … ${lines.length - RESULT_PREVIEW_LINES} more lines`) : ""
           out(`${event.payload.isError ? red(shown) : dim(shown)}${more}\n`)
