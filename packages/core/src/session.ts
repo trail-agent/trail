@@ -1,13 +1,12 @@
 // A session: binds workspaces and a model, runs turns through the agent loop, and logs every step as events.
 
 import { randomUUID } from "node:crypto"
-import { existsSync, readFileSync } from "node:fs"
-import { join } from "node:path"
 import { runAgent } from "@trail-agent/agent"
 import { rejectionMessage, renderReport, validateClaims, type Validation } from "@trail-agent/evidence"
-import { computeCost, type LlmEvent, type Provider } from "@trail-agent/llm"
+import { computeCost, type HttpRequest, type LlmEvent, type Provider } from "@trail-agent/llm"
 import {
   eventsOfType,
+  type AssistantMessage,
   type Claim,
   type Evidence,
   type Message,
@@ -22,12 +21,15 @@ import {
   builtinTools,
   COMPLETE_TOOL_NAME,
   completeSpec,
+  TASK_TOOL_NAME,
+  taskSpec,
   createFileTracker,
   validate,
   type ToolDefinition,
   type ToolRunResult,
 } from "@trail-agent/tools"
 import { createLocalOperations, type Operations } from "@trail-agent/workspace"
+import { createCompactor, DEFAULT_COMPACTION, type CompactionSettings } from "./compaction.ts"
 import { checkPermission } from "./permissions.ts"
 import { buildSystemPrompt } from "./prompt.ts"
 import type { EventStore } from "./store.ts"
@@ -40,6 +42,13 @@ const MAX_OUTPUT_BYTES = 50 * 1024
 const HEAD_LINES = 200
 const TAIL_LINES = 100
 const INSTRUCTION_FILES = ["AGENTS.md", "CLAUDE.md"]
+
+const SUBAGENT_MAX_STEPS = 40
+const SUBAGENT_NOTE = `
+
+<subagent>
+You are a subagent working for another agent, not talking to the user. Do the investigation described in the prompt, then reply with a concise report of what you found, citing evidence ids. You cannot call complete or task. Do not change files unless the prompt asks you to.
+</subagent>`
 
 const REMINDER =
   "You changed files but have not called complete. Verify the change (for example run the tests), then call complete with claims citing evidence ids. If something blocks you, say what it is."
@@ -59,6 +68,9 @@ export interface SessionDeps {
   onEvent?(event: TrailEvent): void
   onStream?(event: LlmEvent): void
   onToolOutput?(chunk: string): void
+  /** Creates Operations for a workspace; the default supports local workspaces only. SSH needs secrets from the host app. */
+  operations?(workspace: SessionWorkspace): Operations
+  compaction?: Partial<CompactionSettings>
 }
 
 export interface TurnResult {
@@ -75,6 +87,8 @@ export interface Session {
   /** Queue a message for the running turn; it reaches the model before its next request. */
   steer(text: string): void
   events(): TrailEvent[]
+  /** Close remote connections. */
+  close(): void
 }
 
 export interface NewSession {
@@ -96,13 +110,14 @@ export async function openSession(deps: SessionDeps, idOrPrefix: string): Promis
   if (!row) throw new Error(`No session ${idOrPrefix}`)
   const sessionId = row.id
   const { store, provider } = deps
-  const ops = new Map<string, Operations>(row.workspaces.map((w) => [w.alias, operationsFor(w)]))
+  const ops = new Map<string, Operations>(row.workspaces.map((w) => [w.alias, (deps.operations ?? localOperations)(w)]))
   const system = await systemPrompt(row.workspaces, row.primary, ops)
   const tracker = createFileTracker()
   const sessionAllowed = new Set<string>()
   const steering: Message[] = []
   const tools = new Map<string, ToolDefinition>(builtinTools.map((t) => [t.spec.name, t]))
-  const specs = [...builtinTools.map((t) => t.spec), completeSpec]
+  const childSpecs = builtinTools.map((t) => t.spec)
+  const specs = [...childSpecs, completeSpec, taskSpec]
 
   const log: EventStore["append"] = (sid, type, payload) => {
     const event = store.append(sid, type, payload)
@@ -115,6 +130,9 @@ export async function openSession(deps: SessionDeps, idOrPrefix: string): Promis
     id: sessionId,
     workspaces: row.workspaces,
     events: () => store.events(sessionId),
+    close() {
+      for (const o of ops.values()) (o as Operations & { close?(): void }).close?.()
+    },
     steer(text) {
       steering.push({ role: "user", text })
     },
@@ -123,13 +141,74 @@ export async function openSession(deps: SessionDeps, idOrPrefix: string): Promis
       log(sessionId, "user/message", { text })
       const context = buildContext(store.events(sessionId))
       const pendingResults = new Map<string, { evidenceId?: string; fullOutputHash?: string }>()
+      const compactor = createCompactor({
+        provider,
+        settings: { ...DEFAULT_COMPACTION, ...deps.compaction },
+        events: () => store.events(sessionId),
+        log: (type, payload) => void log(sessionId, type, payload),
+        putBlob: (text) => store.putBlob(text),
+        fixedTokens: Math.ceil((system.length + JSON.stringify(specs).length) / 4),
+      })
       let rejections = 0
       let reminders = 0
       let completed: { report: string; validation: Validation; proofFailed: boolean } | undefined
 
+      const logRequest = (http: HttpRequest) => {
+        const body = JSON.stringify(http.body)
+        log(sessionId, "llm/request", { model: provider.config.model, protocol: provider.config.protocol, url: http.url, bodyHash: store.putBlob(body), bodyBytes: Buffer.byteLength(body) })
+      }
+      const logResponse = (message: AssistantMessage, meta: { durationMs: number; firstTokenMs?: number }) => {
+        log(sessionId, "llm/response", { stopReason: message.stopReason, durationMs: Math.round(meta.durationMs), firstTokenMs: meta.firstTokenMs === undefined ? undefined : Math.round(meta.firstTokenMs), error: message.errorMessage })
+        if (message.usage) log(sessionId, "llm/usage", { model: provider.config.model, usage: message.usage, cost: computeCost(message.usage, provider.config.price) })
+      }
+      // User messages (prompts, steering, reminders) are logged where they are created, so only these two are logged here.
+      const logMessage = (message: Message) => {
+        if (message.role === "assistant") log(sessionId, "assistant/message", { message })
+        else if (message.role === "tool") {
+          const meta = pendingResults.get(message.callId) ?? {}
+          log(sessionId, "tool/result", { callId: message.callId, name: message.name, content: message.content, isError: message.isError, ...meta })
+        }
+      }
+
+      /** Run a subagent with its own context; its events are bracketed so they stay out of the parent's context. */
+      const runSubagent = async (call: ToolCall, toolSignal?: AbortSignal): Promise<ToolRunResult> => {
+        const problems = validate(taskSpec.parameters, call.args)
+        if (problems.length > 0) return { content: `Invalid task call: ${problems.join("; ")}`, isError: true }
+        const args = call.args as { description: string; prompt: string }
+        log(sessionId, "subagent/start", { callId: call.id, description: args.description })
+        const evidenceBefore = allEvidence().length
+        const childContext: Message[] = [{ role: "user", text: args.prompt }]
+        log(sessionId, "user/message", { text: args.prompt })
+        const childTool = async (child: ToolCall, childSignal?: AbortSignal) => {
+          log(sessionId, "tool/call", { callId: child.id, name: child.name, args: child.args })
+          const result = tools.has(child.name) ? await runTool(child, childSignal) : { content: `${child.name} is not available to subagents.`, isError: true }
+          return { message: { role: "tool" as const, callId: child.id, name: child.name, content: result.content, isError: result.isError ?? false } }
+        }
+        const outcome = await runAgent(
+          childContext,
+          {
+            provider,
+            system: system + SUBAGENT_NOTE,
+            tools: childSpecs,
+            maxSteps: SUBAGENT_MAX_STEPS,
+            hooks: { onRequest: logRequest, onAssistantMessage: logResponse, onMessageAdded: logMessage, executeTool: childTool },
+          },
+          toolSignal,
+        )
+        log(sessionId, "subagent/end", { callId: call.id, reason: outcome.reason })
+        const answer = [...childContext].reverse().find((m): m is AssistantMessage => m.role === "assistant" && m.text.trim() !== "")?.text.trim()
+        const evidence = allEvidence().slice(evidenceBefore).map((e) => e.id)
+        const stopped = outcome.reason === "no_tool_calls" ? "" : `\n[subagent stopped: ${outcome.reason}${outcome.error ? ` (${outcome.error})` : ""}]`
+        return {
+          content: `${answer ?? "(the subagent gave no answer)"}${stopped}${evidence.length > 0 ? `\n[subagent evidence: ${evidence.join(", ")}]` : ""}`,
+          isError: outcome.reason === "error" || outcome.reason === "aborted",
+        }
+      }
+
       const executeTool = async (call: ToolCall, toolSignal?: AbortSignal) => {
         log(sessionId, "tool/call", { callId: call.id, name: call.name, args: call.args })
-        const result: ToolRunResult & { terminate?: boolean } = call.name === COMPLETE_TOOL_NAME ? handleComplete(call) : await runTool(call, toolSignal)
+        const result: ToolRunResult & { terminate?: boolean } =
+          call.name === COMPLETE_TOOL_NAME ? handleComplete(call) : call.name === TASK_TOOL_NAME ? await runSubagent(call, toolSignal) : await runTool(call, toolSignal)
         const message: ToolResultMessage = { role: "tool", callId: call.id, name: call.name, content: result.content, isError: result.isError ?? false }
         return { message, terminate: result.terminate }
       }
@@ -161,7 +240,9 @@ export async function openSession(deps: SessionDeps, idOrPrefix: string): Promis
         const problems = validate(tool.spec.parameters, call.args)
         if (problems.length > 0) return { content: `Invalid arguments: ${problems.join("; ")}`, isError: true }
         const args = call.args as Record<string, unknown>
-        const alias = typeof args.workspace === "string" ? args.workspace : row.primary
+        const target = tool.target?.(args) ?? {}
+        const alias = target.workspace ?? (typeof args.workspace === "string" ? args.workspace : row.primary)
+        const targetPath = target.path ?? (typeof args.path === "string" ? args.path : undefined)
         const workspace = row.workspaces.find((w) => w.alias === alias)
         const workspaceOps = ops.get(alias)
         if (!workspace || !workspaceOps) {
@@ -169,7 +250,7 @@ export async function openSession(deps: SessionDeps, idOrPrefix: string): Promis
         }
 
         const command = tool.effect === "exec" && typeof args.command === "string" ? args.command : undefined
-        const path = typeof args.path === "string" ? workspaceOps.resolve(args.path) : undefined
+        const path = targetPath === undefined ? undefined : workspaceOps.resolve(targetPath)
         const allowKey = `${alias}:${tool.spec.name}`
         const permission = checkPermission({
           effect: tool.effect,
@@ -193,6 +274,8 @@ export async function openSession(deps: SessionDeps, idOrPrefix: string): Promis
           result = await tool.execute(args, {
             ops: workspaceOps,
             workspace: alias,
+            primaryWorkspace: row.primary,
+            workspaceOps: (other) => ops.get(other),
             tracker,
             signal: toolSignal,
             onOutput: deps.onToolOutput,
@@ -229,24 +312,16 @@ export async function openSession(deps: SessionDeps, idOrPrefix: string): Promis
           tools: specs,
           maxSteps: deps.maxSteps ?? 100,
           hooks: {
-            onRequest(http) {
-              const body = JSON.stringify(http.body)
-              log(sessionId, "llm/request", { model: provider.config.model, protocol: provider.config.protocol, url: http.url, bodyHash: store.putBlob(body), bodyBytes: Buffer.byteLength(body) })
-            },
+            onRequest: logRequest,
             onStreamEvent: deps.onStream,
             onAssistantMessage(message, meta) {
-              log(sessionId, "llm/response", { stopReason: message.stopReason, durationMs: Math.round(meta.durationMs), firstTokenMs: meta.firstTokenMs === undefined ? undefined : Math.round(meta.firstTokenMs), error: message.errorMessage })
-              if (message.usage) log(sessionId, "llm/usage", { model: provider.config.model, usage: message.usage, cost: computeCost(message.usage, provider.config.price) })
+              if (message.usage) compactor.noteUsage(message.usage.input + message.usage.cacheRead + message.usage.cacheWrite)
+              logResponse(message, meta)
             },
-            // User messages (steering, reminders) are logged where they are created, so only these two are logged here.
-            onMessageAdded(message) {
-              if (message.role === "assistant") log(sessionId, "assistant/message", { message })
-              else if (message.role === "tool") {
-                const meta = pendingResults.get(message.callId) ?? {}
-                log(sessionId, "tool/result", { callId: message.callId, name: message.name, content: message.content, isError: message.isError, ...meta })
-              }
-            },
+            onMessageAdded: logMessage,
             executeTool,
+            prepareContext: (ctx) => compactor.beforeRequest(ctx),
+            recoverFromError: (message, ctx) => compactor.recover(message, ctx),
             takeSteering() {
               const queued = steering.splice(0)
               for (const message of queued) if (message.role === "user") log(sessionId, "user/message", { text: message.text })
@@ -270,26 +345,36 @@ export async function openSession(deps: SessionDeps, idOrPrefix: string): Promis
   }
 }
 
-function operationsFor(workspace: SessionWorkspace): Operations {
+function localOperations(workspace: SessionWorkspace): Operations {
   if (workspace.workspace.kind === "local") return createLocalOperations(workspace.workspace.path)
-  throw new Error(`SSH workspaces arrive in milestone M2 (workspace "${workspace.alias}")`)
+  throw new Error(`Workspace "${workspace.alias}" is remote; the host app must provide SessionDeps.operations`)
 }
 
+/** Workspace facts and project instructions; an unreachable machine is described as such instead of failing the session. */
 async function systemPrompt(workspaces: SessionWorkspace[], primary: string, ops: Map<string, Operations>): Promise<string> {
-  const prompted = await Promise.all(
+  const described = await Promise.all(
     workspaces.map(async (w) => {
       const o = ops.get(w.alias)!
-      const info = await o.info()
-      return { alias: w.alias, primary: w.alias === primary, os: info.os, shell: info.shell, root: o.root, permission: w.permission, role: w.role }
+      try {
+        const info = await o.info()
+        const instruction = await readInstructions(o)
+        return { prompt: { alias: w.alias, primary: w.alias === primary, os: info.os, shell: info.shell, root: o.root, permission: w.permission, role: w.role }, instruction }
+      } catch (error) {
+        const os = `unreachable (${error instanceof Error ? error.message : String(error)})`
+        return { prompt: { alias: w.alias, primary: w.alias === primary, os, shell: "unknown", root: o.root, permission: w.permission, role: w.role }, instruction: undefined }
+      }
     }),
   )
-  const instructions: Array<{ workspace: string; file: string; content: string }> = []
-  for (const w of workspaces) {
-    if (w.workspace.kind !== "local") continue
-    const file = INSTRUCTION_FILES.find((name) => existsSync(join(w.workspace.path, name)))
-    if (file) instructions.push({ workspace: w.alias, file, content: readFileSync(join(w.workspace.path, file), "utf8") })
+  const instructions = described.flatMap((d, i) => (d.instruction ? [{ workspace: workspaces[i]!.alias, ...d.instruction }] : []))
+  return buildSystemPrompt({ workspaces: described.map((d) => d.prompt), instructions, date: new Date().toLocaleDateString("sv-SE") })
+}
+
+async function readInstructions(o: Operations): Promise<{ file: string; content: string } | undefined> {
+  for (const file of INSTRUCTION_FILES) {
+    const path = o.resolve(file)
+    if ((await o.stat(path)).isFile) return { file, content: (await o.readFile(path)).toString("utf8") }
   }
-  return buildSystemPrompt({ workspaces: prompted, instructions, date: new Date().toLocaleDateString("sv-SE") })
+  return undefined
 }
 
 function evidenceLine(evidence: Evidence): string {

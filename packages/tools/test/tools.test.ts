@@ -8,7 +8,8 @@ import { bashTool, createFileTracker, editTool, readTool, validate, writeTool, t
 
 function context(): { ctx: ToolContext; root: string } {
   const root = mkdtempSync(join(tmpdir(), "trail-tools-"))
-  const ctx: ToolContext = { ops: createLocalOperations(root), workspace: "local", tracker: createFileTracker(), readOutput: () => undefined }
+  const ops = createLocalOperations(root)
+  const ctx: ToolContext = { ops, workspace: "local", primaryWorkspace: "local", workspaceOps: () => ops, tracker: createFileTracker(), readOutput: () => undefined }
   return { ctx, root }
 }
 

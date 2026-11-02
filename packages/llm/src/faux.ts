@@ -25,7 +25,8 @@ export function createFauxProvider(script: FauxScript, config?: Partial<ModelCon
   }
   return {
     config: fullConfig,
-    prepare: (request): HttpRequest => ({ url: "faux://complete", headers: {}, body: request }),
+    // Snapshot like a real provider serializing its body, so later context changes do not leak in.
+    prepare: (request): HttpRequest => ({ url: "faux://complete", headers: {}, body: structuredClone(request) }),
     async *stream(http): AsyncGenerator<LlmEvent> {
       const request = http.body as LlmRequest
       const reply = script(request, index)

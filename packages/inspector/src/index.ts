@@ -75,7 +75,20 @@ export function timeline(events: readonly TrailEvent[]): string[] {
         break
       case "llm/request":
         request++
-        lines.push(`#${event.seq} request ${request} → ${event.payload.model} (${n(event.payload.bodyBytes)} bytes)`)
+        lines.push(`#${event.seq} request ${request} → ${event.payload.model} (${n(event.payload.bodyBytes)} bytes)${event.payload.purpose ? ` [${event.payload.purpose}]` : ""}`)
+        break
+      case "compaction/applied":
+        lines.push(
+          event.payload.kind === "prune"
+            ? `#${event.seq} context pruned: ${event.payload.callIds.length} old tool outputs (≈${n(event.payload.tokensBefore)} tokens before)`
+            : `#${event.seq} context summarized through #${event.payload.throughSeq} (${event.payload.trigger}, ≈${n(event.payload.tokensBefore)} tokens before)`,
+        )
+        break
+      case "subagent/start":
+        lines.push(`#${event.seq} subagent started: ${oneLine(event.payload.description)}`)
+        break
+      case "subagent/end":
+        lines.push(`#${event.seq} subagent finished: ${event.payload.reason}`)
         break
       case "llm/usage": {
         const u = event.payload.usage

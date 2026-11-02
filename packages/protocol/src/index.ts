@@ -144,7 +144,7 @@ export interface EventPayloads {
   "turn/end": { reason: TurnEndReason }
   "user/message": { text: string }
   "assistant/message": { message: AssistantMessage }
-  "llm/request": { model: string; protocol: string; url: string; bodyHash: string; bodyBytes: number }
+  "llm/request": { model: string; protocol: string; url: string; bodyHash: string; bodyBytes: number; purpose?: "compaction" }
   "llm/response": { stopReason: StopReason; durationMs: number; firstTokenMs?: number; error?: string }
   "llm/usage": { model: string; usage: Usage; cost: number }
   "tool/call": { callId: string; name: string; args: unknown }
@@ -164,6 +164,13 @@ export interface EventPayloads {
   "complete/rejected": { callId: string; problems: string[] }
   "complete/accepted": { callId: string; warnings: string[] }
   "reminder/added": { text: string }
+  /** Context compaction never deletes events; it changes how the log is projected into the model's context. */
+  "compaction/applied":
+    | { kind: "prune"; callIds: string[]; tokensBefore: number }
+    | { kind: "summary"; summary: string; throughSeq: number; tokensBefore: number; trigger: "threshold" | "overflow" }
+  /** Events between start and end belong to a subagent and are not part of the parent's context. */
+  "subagent/start": { callId: string; description: string }
+  "subagent/end": { callId: string; reason: TurnEndReason }
 }
 
 export type TurnEndReason = "completed" | "no_tool_calls" | "max_steps" | "error" | "aborted" | "proof_failed"

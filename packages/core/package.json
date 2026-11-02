@@ -3,7 +3,16 @@
   "version": "0.0.1",
   "type": "module",
   "license": "AGPL-3.0-only",
-  
-  "exports": { ".": "./src/index.ts" },
-  "dependencies": { "@trail-agent/protocol": "*","@trail-agent/llm": "*","@trail-agent/agent": "*","@trail-agent/workspace": "*","@trail-agent/tools": "*","@trail-agent/evidence": "*" }
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@napi-rs/keyring": "^2.1.2",
+    "@trail-agent/agent": "*",
+    "@trail-agent/evidence": "*",
+    "@trail-agent/llm": "*",
+    "@trail-agent/protocol": "*",
+    "@trail-agent/tools": "*",
+    "@trail-agent/workspace": "*"
+  }
 }

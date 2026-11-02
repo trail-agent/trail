@@ -57,7 +57,7 @@ export interface Operations {
   isInside(absolutePath: string): boolean
   readFile(absolutePath: string): Promise<Buffer>
   /** Write a file, creating parent directories. */
-  writeFile(absolutePath: string, content: string): Promise<void>
+  writeFile(absolutePath: string, content: string | Buffer): Promise<void>
   stat(absolutePath: string): Promise<FileStat>
   listDir(absolutePath: string): Promise<Array<{ name: string; isDirectory: boolean }>>
   exec(command: string, options?: ExecOptions): Promise<ExecResult>

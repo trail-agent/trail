@@ -61,7 +61,8 @@ export function createRenderer(write: (text: string) => void = (t) => process.st
           newline()
           const args = (event.payload.args ?? {}) as Record<string, unknown>
           const describe = describers.get(event.payload.name)
-          const described = event.payload.name === "complete" ? String(args.summary ?? "") : describe ? describe(args) : JSON.stringify(args)
+          const special: Record<string, unknown> = { complete: args.summary, task: args.description }
+          const described = event.payload.name in special ? String(special[event.payload.name] ?? "") : describe ? describe(args) : JSON.stringify(args)
           const summary = described.startsWith(`${event.payload.name} `) ? described.slice(event.payload.name.length + 1) : described
           const where = typeof args.workspace === "string" ? dim(` @${args.workspace}`) : ""
           out(`${cyan("●")} ${bold(event.payload.name)} ${summary}${where}\n`)
@@ -87,6 +88,18 @@ export function createRenderer(write: (text: string) => void = (t) => process.st
         case "reminder/added":
           newline()
           out(dim("  (reminded the agent to prove its work)\n"))
+          break
+        case "compaction/applied":
+          newline()
+          out(dim(event.payload.kind === "prune" ? `  (context: removed ${event.payload.callIds.length} old tool outputs)\n` : `  (context: summarized earlier history, ${event.payload.trigger})\n`))
+          break
+        case "subagent/start":
+          newline()
+          out(`${cyan("◆")} ${bold("subagent")} ${event.payload.description}\n`)
+          break
+        case "subagent/end":
+          newline()
+          out(dim(`  subagent finished (${event.payload.reason})\n`))
           break
         case "llm/response":
           mode = "other"

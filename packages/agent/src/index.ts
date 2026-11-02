@@ -29,6 +29,10 @@ export interface AgentHooks {
   takeSteering?(): Message[]
   /** Called for every message the loop adds to the context. */
   onMessageAdded?(message: Message): void
+  /** Called before every request; may rewrite `context` in place, e.g. to compact it. */
+  prepareContext?(context: Message[]): Promise<void>
+  /** Called when a request fails; returning true retries the step (e.g. after compacting an over-long context). */
+  recoverFromError?(message: AssistantMessage, context: Message[]): Promise<boolean>
 }
 
 export interface AgentConfig {
@@ -55,10 +59,12 @@ export async function runAgent(context: Message[], config: AgentConfig, signal?:
     context.push(message)
     hooks.onMessageAdded?.(message)
   }
+  let recovered = false
   for (let step = 0; ; step++) {
     for (const message of hooks.takeSteering?.() ?? []) add(message)
     if (signal?.aborted) return { reason: "aborted" }
     if (step >= config.maxSteps) return { reason: "max_steps" }
+    await hooks.prepareContext?.(context)
 
     const http = config.provider.prepare({ system: config.system, messages: context, tools: config.tools, maxTokens: config.maxTokens })
     hooks.onRequest?.(http)
@@ -72,6 +78,11 @@ export async function runAgent(context: Message[], config: AgentConfig, signal?:
     }
     if (!message) return { reason: "error", error: "provider ended without a final message" }
     hooks.onAssistantMessage?.(message, { durationMs: performance.now() - started, firstTokenMs })
+    // One recovery per run: a failed request that the host can fix (over-long context) is retried, not recorded.
+    if (message.stopReason === "error" && !recovered && hooks.recoverFromError && (await hooks.recoverFromError(message, context))) {
+      recovered = true
+      continue
+    }
     add(message)
 
     if (message.stopReason === "aborted") return { reason: "aborted" }

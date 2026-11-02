@@ -1,13 +1,15 @@
 // The `trail` command: run tasks, keep chatting in a session, list, inspect and report.
 
 import { existsSync, statSync } from "node:fs"
-import { basename, resolve } from "node:path"
+import { resolve } from "node:path"
 import { createInterface, type Interface } from "node:readline"
 import {
   configPath,
   createSession,
   databasePath,
+  keychainSecrets,
   loadConfig,
+  operationsFactory,
   openSession,
   openStore,
   pickModel,
@@ -21,6 +23,7 @@ import { formatUsage, requests, timeline, usageTotals } from "@trail-agent/inspe
 import { createProvider } from "@trail-agent/llm"
 import { eventsOfType, type PermissionDecision, type PermissionLevel } from "@trail-agent/protocol"
 import { bold, createRenderer, cyan, dim, green, red, yellow } from "./ui.ts"
+import { describeWorkspaces, resolveSessionWorkspaces, workspaceCommand } from "./workspaces.ts"
 
 const HELP = `trail — a coding agent that proves its work
 
@@ -32,12 +35,20 @@ Usage
   trail inspect <session>       timeline, tokens and cost
   trail inspect <session> --request <n>   print the exact body of request n
   trail models                  list configured models
+  trail ws                      list saved workspaces
+  trail ws add-ssh [name] [user@host] [/remote/path]   save a server (asks for the password, checks the host key)
+  trail ws add-local <name> <path>                     save a local directory
+  trail ws test <name> | trail ws remove <name>
 
 Options
   -w, --workspace <dir>   workspace directory (default: current directory)
   -m, --model <id>        model id from the config
   --yes                   full permission: run edits and commands without asking
-  --read-only             read-only workspace
+  --read-only             read-only local workspace
+  -W, --with <alias=name[:level]>   attach a saved workspace, e.g. -W staging=web1:full -W prod=web2
+                          levels: full, ask-write, read-only, ask-all (prod-like names default to read-only)
+  --primary <alias>       workspace tools use by default (default: local)
+  --no-local              do not attach the current directory
   --max-steps <n>         stop after n model requests per turn (default 100)
 
 Models come from ${"$"}TRAIL_HOME/config.json (default ~/.trail/config.json), ANTHROPIC_API_KEY,
@@ -55,11 +66,18 @@ interface Args {
   readOnly: boolean
   maxSteps?: number
   request?: number
+  with: string[]
+  primary?: string
+  noLocal: boolean
+  port?: number
+  key?: string
+  desc?: string
+  trust?: string
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { command: "run", positional: [], yes: false, readOnly: false }
-  const commands = new Set(["resume", "sessions", "report", "inspect", "models", "help"])
+  const args: Args = { command: "run", positional: [], yes: false, readOnly: false, with: [], noLocal: false }
+  const commands = new Set(["resume", "sessions", "report", "inspect", "models", "help", "ws"])
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!
     const value = () => {
@@ -73,6 +91,13 @@ function parseArgs(argv: string[]): Args {
     else if (a === "--read-only") args.readOnly = true
     else if (a === "--max-steps") args.maxSteps = Number(value())
     else if (a === "--request") args.request = Number(value())
+    else if (a === "-W" || a === "--with") args.with.push(value())
+    else if (a === "--primary") args.primary = value()
+    else if (a === "--no-local") args.noLocal = true
+    else if (a === "--port") args.port = Number(value())
+    else if (a === "--key") args.key = value()
+    else if (a === "--desc") args.desc = value()
+    else if (a === "--trust") args.trust = value()
     else if (a === "-h" || a === "--help") args.command = "help"
     else if (args.positional.length === 0 && args.command === "run" && commands.has(a)) args.command = a
     else args.positional.push(a)
@@ -86,6 +111,7 @@ export async function runCli(argv: string[]): Promise<number> {
     console.log(HELP)
     return 0
   }
+  if (args.command === "ws") return workspaceCommand(args.positional.shift(), args.positional, args)
   if (args.command === "models") {
     const config = loadConfig()
     if (config.models.length === 0) console.log(`No models. See \`trail help\`; config file: ${configPath()}`)
@@ -187,19 +213,19 @@ async function runSession(store: EventStore, args: Args): Promise<number> {
     maxSteps: args.maxSteps ?? config.maxSteps,
     onEvent: (e) => renderer.event(e),
     onStream: (e) => renderer.stream(e),
+    operations: operationsFactory(keychainSecrets()),
   }
 
   const startTurn = async (text: string): Promise<TurnResult> => {
     if (!session) {
       const path = resolve(args.workspace ?? process.cwd())
       if (!existsSync(path) || !statSync(path).isDirectory()) throw new Error(`Not a directory: ${path}`)
-      const permission: PermissionLevel = args.readOnly ? "read-only" : args.yes ? "full" : "ask-write"
-      session = await createSession(deps, {
-        title: text.replace(/\s+/g, " ").slice(0, 60),
-        primary: "local",
-        workspaces: [{ alias: "local", permission, workspace: { id: "local", name: basename(path), kind: "local", path } }],
-      })
-      console.log(dim(`session ${session.id.slice(0, 8)} · ${modelConfig.id} (${modelConfig.model}) · ${path} · ${permission}`))
+      const localLevel: PermissionLevel = args.readOnly ? "read-only" : args.yes ? "full" : "ask-write"
+      const workspaces = resolveSessionWorkspaces(args.with, path, { noLocal: args.noLocal, localLevel })
+      const primary = args.primary ?? workspaces[0]!.alias
+      if (!workspaces.some((w) => w.alias === primary)) throw new Error(`--primary ${primary} is not one of: ${workspaces.map((w) => w.alias).join(", ")}`)
+      session = await createSession(deps, { title: text.replace(/\s+/g, " ").slice(0, 60), primary, workspaces })
+      console.log(dim(`session ${session.id.slice(0, 8)} · ${modelConfig.id} (${modelConfig.model}) · primary ${primary} · `) + describeWorkspaces(workspaces))
     }
     busy = true
     controller = new AbortController()
@@ -230,7 +256,7 @@ async function runSession(store: EventStore, args: Args): Promise<number> {
   }
 
   if (task) {
-    const result = await startTurn(task)
+    const result = await startTurn(task).finally(() => session?.close())
     rl?.close()
     return result.reason === "completed" || result.reason === "no_tool_calls" ? 0 : 1
   }
@@ -239,7 +265,10 @@ async function runSession(store: EventStore, args: Args): Promise<number> {
   console.log(dim("Describe a task. /exit to quit."))
   rl.prompt()
   return await new Promise<number>((resolveExit) => {
-    rl!.on("close", () => resolveExit(0))
+    rl!.on("close", () => {
+      session?.close()
+      resolveExit(0)
+    })
     rl!.on("line", (line) => {
       if (pendingAnswer) {
         const answer = pendingAnswer

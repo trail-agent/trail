@@ -17,6 +17,9 @@ export interface ToolContext {
   ops: Operations
   /** Workspace alias the call runs in. */
   workspace: string
+  /** Operations of any workspace in the session, for tools that span machines. */
+  workspaceOps(alias: string): Operations | undefined
+  primaryWorkspace: string
   tracker: FileTracker
   signal?: AbortSignal
   onOutput?(chunk: string): void
@@ -36,6 +39,11 @@ export interface ToolDefinition<Args = Record<string, unknown>> {
   effect: ToolEffect
   /** One line for permission prompts and timelines. */
   describe(args: Args): string
+  /**
+   * Where the call takes effect, for permissions and evidence. Defaults to `args.workspace` and `args.path`;
+   * tools that span workspaces (transfer) name their destination here.
+   */
+  target?(args: Args): { workspace?: string; path?: string }
   execute(args: Args, context: ToolContext): Promise<ToolRunResult>
 }
 

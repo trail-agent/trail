@@ -14,4 +14,18 @@ export {
   type TurnResult,
 } from "./session.ts"
 export { openStore, type EventStore, type SessionRow } from "./store.ts"
-export { buildContext } from "./view.ts"
+export { buildContext, buildContextWithSeqs } from "./view.ts"
+export { chooseCut, createCompactor, DEFAULT_COMPACTION, estimateTokens, type CompactionSettings } from "./compaction.ts"
+export {
+  defaultPermission,
+  findWorkspace,
+  keychainSecrets,
+  loadWorkspaces,
+  operationsFactory,
+  saveWorkspaces,
+  sshSecretKey,
+  storeSshSecrets,
+  workspacesPath,
+  type SavedWorkspace,
+  type SecretStore,
+} from "./workspaces.ts"
