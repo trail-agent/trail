@@ -1,0 +1,20 @@
+{
+  "name": "@trail-agent/cli",
+  "version": "0.0.1",
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "bin": {
+    "trail": "./src/main.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@trail-agent/protocol": "*",
+    "@trail-agent/llm": "*",
+    "@trail-agent/core": "*",
+    "@trail-agent/evidence": "*",
+    "@trail-agent/inspector": "*",
+    "@trail-agent/tools": "*"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "@trail-agent/agent",
+  "version": "0.0.1",
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": { "@trail-agent/protocol": "*","@trail-agent/llm": "*" }
+}

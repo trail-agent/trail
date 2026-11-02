@@ -1,0 +1,36 @@
+{
+  "defaultModel": "deepseek",
+  "maxSteps": 100,
+  "models": [
+    {
+      "id": "deepseek",
+      "protocol": "openai-compat",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKey": "env:DEEPSEEK_API_KEY",
+      "model": "REPLACE-with-the-model-id-from-the-provider-docs",
+      "contextWindow": 128000,
+      "maxOutput": 8192,
+      "price": { "input": 0, "output": 0, "cacheRead": 0 },
+      "compat": { "sendReasoningContent": true }
+    },
+    {
+      "id": "claude",
+      "protocol": "anthropic",
+      "baseUrl": "https://api.anthropic.com",
+      "apiKey": "env:ANTHROPIC_API_KEY",
+      "model": "claude-opus-5-5",
+      "contextWindow": 1000000,
+      "maxOutput": 64000,
+      "price": { "input": 4, "output": 20, "cacheRead": 0.2, "cacheWrite": 5 },
+      "anthropic": { "effort": "high", "thinkingDisplay": "summarized", "fallbacks": "default" }
+    },
+    {
+      "id": "local",
+      "protocol": "openai-compat",
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "model": "REPLACE-with-a-local-model",
+      "contextWindow": 32000,
+      "maxOutput": 4096
+    }
+  ]
+}
